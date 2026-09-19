@@ -21,6 +21,32 @@ from .negotiation import (
 )
 
 
+def _check_supported_tags(value: list[str]) -> list[str]:
+    normalized_seen: set[str] = set()
+    for tag in value:
+        if not isinstance(tag, str) or not TAG_RE.fullmatch(tag):
+            raise ValueError(f"不是合法的 BCP 47 标签: {tag!r}")
+        key = tag.lower()
+        if key in normalized_seen:
+            raise ValueError(f"supported_languages 存在重复标签（大小写不敏感）: {tag!r}")
+        normalized_seen.add(key)
+    return value
+
+
+def _check_default_tag(value: str) -> str:
+    if not TAG_RE.fullmatch(value):
+        raise ValueError(f"default_language 不是合法的 BCP 47 标签: {value!r}")
+    return value
+
+
+def _check_default_in_supported(supported: list[str], default: str) -> None:
+    supported_lower = {tag.lower() for tag in supported}
+    if default.lower() not in supported_lower:
+        raise ValueError(
+            "default_language 必须包含在 supported_languages 中（大小写不敏感）"
+        )
+
+
 class NegotiationRequest(BaseModel):
     """Negotiation input.
 
@@ -59,22 +85,12 @@ class NegotiationRequest(BaseModel):
     @field_validator("supported_languages")
     @classmethod
     def _validate_supported(cls, value: list[str]) -> list[str]:
-        normalized_seen: set[str] = set()
-        for tag in value:
-            if not isinstance(tag, str) or not TAG_RE.fullmatch(tag):
-                raise ValueError(f"不是合法的 BCP 47 标签: {tag!r}")
-            key = tag.lower()
-            if key in normalized_seen:
-                raise ValueError(f"supported_languages 存在重复标签（大小写不敏感）: {tag!r}")
-            normalized_seen.add(key)
-        return value
+        return _check_supported_tags(value)
 
     @field_validator("default_language")
     @classmethod
     def _validate_default(cls, value: str) -> str:
-        if not TAG_RE.fullmatch(value):
-            raise ValueError(f"default_language 不是合法的 BCP 47 标签: {value!r}")
-        return value
+        return _check_default_tag(value)
 
     @field_validator("locale_fallbacks", mode="before")
     @classmethod
@@ -103,11 +119,7 @@ class NegotiationRequest(BaseModel):
 
     @model_validator(mode="after")
     def _default_must_be_supported(self) -> "NegotiationRequest":
-        supported_lower = {tag.lower() for tag in self.supported_languages}
-        if self.default_language.lower() not in supported_lower:
-            raise ValueError(
-                "default_language 必须包含在 supported_languages 中（大小写不敏感）"
-            )
+        _check_default_in_supported(self.supported_languages, self.default_language)
         return self
 
 
@@ -168,6 +180,121 @@ class NegotiationResponse(BaseModel):
     # language; the endpoint drops this key entirely when unused, so
     # requests without locale_fallbacks keep the exact legacy payload.
     locale_fallback: LocaleFallbackReport | None = None
+
+
+class GroupParticipant(BaseModel):
+    """One group member: a unique id plus their raw Accept-Language header."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        min_length=1,
+        title="参与者唯一标识",
+        description="请求内不可重复（精确匹配，区分大小写）",
+    )
+    accept_language: str | None = Field(
+        default=None,
+        title="该参与者的原始 Accept-Language 头",
+        description="缺失/null/空白表示该参与者接受任意语言（弃权，不参与否决）",
+    )
+
+
+class GroupNegotiationRequest(BaseModel):
+    """Group negotiation input.
+
+    ``participants`` is a non-empty list of members, each with a unique
+    ``id`` and an optional ``accept_language`` header. Every participant
+    is evaluated with the same RFC 9110/4647 lookup semantics as the
+    single negotiation endpoint; the resulting weight matrix decides one
+    language acceptable to the whole group.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    participants: list[GroupParticipant] = Field(
+        min_length=1,
+        title="参与者列表（至少 1 人，id 不可重复）",
+    )
+    supported_languages: list[str] = Field(
+        min_length=1,
+        title="服务端支持的 BCP 47 语言标签（按优先级/稳定顺序排列）",
+    )
+    default_language: str = Field(
+        title="默认语言标签，必须包含在 supported_languages 中"
+    )
+
+    @field_validator("participants")
+    @classmethod
+    def _validate_unique_ids(
+        cls, value: list[GroupParticipant]
+    ) -> list[GroupParticipant]:
+        seen: set[str] = set()
+        for participant in value:
+            if participant.id in seen:
+                raise ValueError(
+                    f"participants 存在重复 id: {participant.id!r}"
+                )
+            seen.add(participant.id)
+        return value
+
+    @field_validator("supported_languages")
+    @classmethod
+    def _validate_supported(cls, value: list[str]) -> list[str]:
+        return _check_supported_tags(value)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default(cls, value: str) -> str:
+        return _check_default_tag(value)
+
+    @model_validator(mode="after")
+    def _default_must_be_supported(self) -> "GroupNegotiationRequest":
+        _check_default_in_supported(self.supported_languages, self.default_language)
+        return self
+
+
+class ParticipantWeight(BaseModel):
+    participant_id: str
+    q: float = Field(
+        description="该参与者对此候选的权重（未命中计 0；弃权参与者计 1）"
+    )
+    matched_range: str | None = Field(
+        description="该参与者实际命中的语言范围（小写）；弃权或未命中为 null"
+    )
+    veto: bool = Field(description="该参与者是否以具体范围 q=0 否决此候选")
+
+
+class GroupCandidateReport(BaseModel):
+    tag: str
+    supported_index: int
+    min_q: float = Field(description="所有参与者中的最低个人权重")
+    total_q: float = Field(description="所有参与者权重之和")
+    vetoed: bool = Field(description="是否被至少一位参与者以具体范围 q=0 否决")
+    vetoed_by: list[str] = Field(
+        description="以具体范围 q=0 否决此候选的参与者 id（按 participants 顺序）"
+    )
+    status: Literal["selected", "eligible", "vetoed", "unacceptable"]
+    weights: list[ParticipantWeight]
+
+
+class GroupParticipantReport(BaseModel):
+    id: str
+    position: int = Field(description="在 participants 数组中的序号（从 1 开始）")
+    abstained: bool = Field(
+        description="是否未提供有效 Accept-Language 头（视为接受任意语言）"
+    )
+    parsed_ranges: list[ParsedRange]
+    ignored_duplicates: list[IgnoredDuplicate]
+
+
+class GroupNegotiationResponse(BaseModel):
+    selected_language: str
+    selected_supported_index: int
+    fallback: bool
+    fallback_reason: Literal["no-common-acceptable-candidate"] | None
+    message: str
+    participants: list[GroupParticipantReport]
+    candidates: list[GroupCandidateReport]
 
 
 class HealthResponse(BaseModel):

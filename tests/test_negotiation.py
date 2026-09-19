@@ -5,7 +5,9 @@ import pytest
 from app.negotiation import (
     AcceptLanguageError,
     LocaleFallbackError,
+    ParticipantHeaderError,
     negotiate,
+    negotiate_group,
     normalize_fallbacks,
     parse_accept_language,
     truncation_chain,
@@ -181,6 +183,13 @@ class TestNegotiate:
         result = negotiate("*", self.SUPPORTED, self.DEFAULT)
         assert result["selected_language"] == "en-US"
         assert result["fallback"] is False
+
+    def test_default_language_case_insensitive_lookup(self):
+        # The schema accepts a default that differs in case from the
+        # supported list entry; the fallback lookup must not crash on it.
+        result = negotiate("fr", ["en-US"], "EN-us")
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
 
 
 class TestFallbackValidation:
@@ -360,3 +369,194 @@ class TestLocaleChainFallback:
         result = negotiate("de", self.SUPPORTED, self.DEFAULT)
         assert "locale_fallback" in result
         assert result["locale_fallback"] is None
+
+
+class TestGroupNegotiate:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    @staticmethod
+    def _candidate(result, tag):
+        return next(c for c in result["candidates"] if c["tag"] == tag)
+
+    def test_min_weight_wins_over_total(self):
+        # en-US has the higher total but the lower minimum -> zh-CN wins.
+        result = negotiate_group(
+            [("alice", "zh;q=0.6,en;q=0.5"), ("bob", "zh;q=0.7,en;q=1.0")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["fallback"] is False
+        zh = self._candidate(result, "zh-CN")
+        en = self._candidate(result, "en-US")
+        assert zh["min_q"] == 0.6 and zh["total_q"] == 1.3
+        assert en["min_q"] == 0.5 and en["total_q"] == 1.5
+        assert zh["status"] == "selected"
+        assert en["status"] == "eligible"
+
+    def test_total_weight_breaks_min_tie(self):
+        # Equal minima: zh-TW wins on total despite its later server position.
+        result = negotiate_group(
+            [
+                ("alice", "zh-tw;q=0.9,zh-cn;q=0.8"),
+                ("bob", "zh-tw;q=0.8,zh-cn;q=0.8"),
+            ],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "zh-TW"
+        zh_tw = self._candidate(result, "zh-TW")
+        zh_cn = self._candidate(result, "zh-CN")
+        assert zh_tw["min_q"] == zh_cn["min_q"] == 0.8
+        assert zh_tw["total_q"] == 1.7
+        assert zh_cn["total_q"] == 1.6
+
+    def test_supported_order_breaks_full_tie(self):
+        result = negotiate_group(
+            [("alice", "zh;q=0.8"), ("bob", "zh;q=0.8")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        # zh-CN and zh-TW have identical weights -> earlier supported tag.
+        assert result["selected_language"] == "zh-CN"
+
+    def test_concrete_q_zero_vetoes_globally(self):
+        result = negotiate_group(
+            [("alice", "zh;q=0,*;q=0.6"), ("bob", "zh;q=0.9,*;q=0.7")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "en-US"
+        zh = self._candidate(result, "zh-CN")
+        assert zh["vetoed"] is True
+        assert zh["vetoed_by"] == ["alice"]
+        assert zh["status"] == "vetoed"
+        # Alice's concrete q=0 hit is recorded as her matched range...
+        assert zh["weights"][0] == {
+            "participant_id": "alice",
+            "q": 0.0,
+            "matched_range": "zh",
+            "veto": True,
+        }
+        # ...while bob still likes zh-CN at 0.9; the veto overrides him.
+        assert zh["weights"][1]["q"] == 0.9
+        assert zh["weights"][1]["veto"] is False
+
+    def test_wildcard_q_zero_is_not_a_veto(self):
+        result = negotiate_group(
+            [("alice", "*;q=0"), ("bob", "en;q=0.9,zh;q=0.8")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        # Alice zeroes every weight via the wildcard but vetoes nothing.
+        assert all(c["vetoed"] is False for c in result["candidates"])
+        assert all(c["vetoed_by"] == [] for c in result["candidates"])
+        # Every candidate still has a zero minimum -> default fallback.
+        assert all(c["status"] == "unacceptable" for c in result["candidates"])
+        assert result["selected_language"] == self.DEFAULT
+        assert result["fallback"] is True
+        assert result["fallback_reason"] == "no-common-acceptable-candidate"
+
+    def test_unmatched_candidate_counts_zero(self):
+        result = negotiate_group(
+            [("alice", "en"), ("bob", "en;q=0.5")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "en-US"
+        zh = self._candidate(result, "zh-CN")
+        assert zh["min_q"] == 0.0
+        assert zh["total_q"] == 0.0
+        assert zh["status"] == "unacceptable"
+        assert all(w["matched_range"] is None for w in zh["weights"])
+
+    def test_null_header_participant_abstains(self):
+        result = negotiate_group(
+            [("alice", None), ("bob", "zh;q=0.8")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "zh-CN"
+        alice = result["participants"][0]
+        assert alice["abstained"] is True
+        assert alice["parsed_ranges"] == []
+        zh = self._candidate(result, "zh-CN")
+        assert zh["weights"][0] == {
+            "participant_id": "alice",
+            "q": 1.0,
+            "matched_range": None,
+            "veto": False,
+        }
+        assert zh["min_q"] == 0.8
+
+    def test_all_abstain_picks_first_supported(self):
+        result = negotiate_group(
+            [("alice", None), ("bob", "   ")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is False
+        assert all(p["abstained"] for p in result["participants"])
+        en = result["candidates"][0]
+        assert en["min_q"] == 1.0 and en["total_q"] == 2.0
+
+    def test_no_common_candidate_falls_back_to_default(self):
+        result = negotiate_group(
+            [("alice", "en;q=0"), ("bob", "zh;q=0,ja;q=0")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+        assert result["fallback_reason"] == "no-common-acceptable-candidate"
+        # The default itself is vetoed by alice: the message says so.
+        assert "默认语言本身" in result["message"]
+
+    def test_group_default_case_insensitive_lookup(self):
+        result = negotiate_group([("alice", "en;q=0")], ["en-US"], "EN-us")
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+
+    def test_per_participant_matched_ranges(self):
+        result = negotiate_group(
+            [("alice", "zh-CN;q=0.9"), ("bob", "zh;q=0.7")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        zh = self._candidate(result, "zh-CN")
+        assert [w["matched_range"] for w in zh["weights"]] == ["zh-cn", "zh"]
+        en = self._candidate(result, "en-US")
+        assert [w["matched_range"] for w in en["weights"]] == [None, None]
+
+    def test_duplicate_ranges_reported_per_participant(self):
+        result = negotiate_group(
+            [("alice", "en;q=0.8,EN;q=0.2"), ("bob", "en")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        alice = result["participants"][0]
+        assert alice["ignored_duplicates"] == [{"range": "en", "position": 2}]
+        assert result["candidates"][0]["weights"][0]["q"] == 0.8
+
+    def test_invalid_participant_header_raises(self):
+        with pytest.raises(ParticipantHeaderError) as excinfo:
+            negotiate_group(
+                [("alice", "en"), ("bob", "fr;q=2")],
+                self.SUPPORTED,
+                self.DEFAULT,
+            )
+        exc = excinfo.value
+        assert isinstance(exc, AcceptLanguageError)
+        assert exc.participant_id == "bob"
+        assert exc.position == 2
+        assert "bob" in str(exc)
+
+    def test_total_q_has_no_float_noise(self):
+        result = negotiate_group(
+            [("alice", "en;q=0.1"), ("bob", "en;q=0.2")],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["candidates"][0]["total_q"] == 0.3

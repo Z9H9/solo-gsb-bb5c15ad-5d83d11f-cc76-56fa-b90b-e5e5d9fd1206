@@ -4,7 +4,10 @@
 BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4647 lookup 逐级截断
 匹配，选出最终语言，并返回**每一个候选标签的接受 / 淘汰轨迹**，方便网关侧排障与
 可观测。当标准 lookup 没有可接受候选时，还可通过可选的 `locale_fallbacks`
-源标签 → 下一标签有向链做定向回退。
+源标签 → 下一标签有向链做定向回退。此外，`/api/v1/negotiate/group` 提供**群体
+协商**：多位参与者各自给出 `Accept-Language`，逐人复用同一套匹配语义构成权重
+矩阵，具体范围 `q=0` 全局否决，按最低个人权重 → 总权重 → 服务端顺序选出共同
+接受的语言。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -20,6 +23,7 @@ docker compose up -d --build
 | --- | --- |
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -181,6 +185,88 @@ curl -X POST http://localhost:8000/api/v1/negotiate \
   范围（`source_range`/`source_q`/`source_position`）、实际路径 `path`（小写标签，
   含起点与终点）与最终标签 `selected_language`；未触发时该键缺省。
 
+## 群体协商（POST /api/v1/negotiate/group）
+
+当需要为一组用户（如同一会议、家庭账号）选出**共同可接受**的单一语言时，使用群体
+协商接口。每位参与者给出自己的 `Accept-Language` 头，服务端**逐人复用与单人接口
+完全相同的 RFC 9110/4647 匹配语义**，构成「参与者 × 候选」权重矩阵后统一决策。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/group \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "participants": [
+      {"id": "alice", "accept_language": "zh;q=0.9,en;q=0.8"},
+      {"id": "bob",   "accept_language": "zh;q=0.7"},
+      {"id": "carol"}
+    ],
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US"
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "selected_language": "zh-CN",
+  "selected_supported_index": 1,
+  "fallback": false,
+  "fallback_reason": null,
+  "participants": [
+    {"id": "carol", "position": 3, "abstained": true,
+     "parsed_ranges": [], "ignored_duplicates": []}
+  ],
+  "candidates": [
+    {
+      "tag": "zh-CN",
+      "supported_index": 1,
+      "min_q": 0.7,
+      "total_q": 2.6,
+      "vetoed": false,
+      "vetoed_by": [],
+      "status": "selected",
+      "weights": [
+        {"participant_id": "alice", "q": 0.9, "matched_range": "zh", "veto": false},
+        {"participant_id": "bob",   "q": 0.7, "matched_range": "zh", "veto": false},
+        {"participant_id": "carol", "q": 1.0, "matched_range": null, "veto": false}
+      ]
+    }
+  ]
+}
+```
+
+### 群体请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `participants` | object[] | 是 | 至少 1 人；`id` 非空且请求内不可重复；`accept_language` 可缺省/`null` |
+| `supported_languages` | string[] | 是 | 与单人接口相同（顺序即稳定优先级） |
+| `default_language` | string | 是 | 与单人接口相同（必须在支持列表中） |
+
+### 群体决策规则
+
+1. **逐人计权**：每位参与者对每个候选标签按单人接口相同的 lookup 语义得到一个
+   权重（具体范围最长前缀命中 → 该范围 q；否则通配符 q；都未命中 → 0）。
+2. **弃权**：`accept_language` 缺失/`null`/空白的参与者视为接受任意语言——对所有
+   候选计 q=1 且不参与否决（其 `abstained=true`）。
+3. **全局否决**：任一参与者以**具体范围 `q=0`** 命中的候选被全局否决
+   （`vetoed=true`，`vetoed_by` 列出否决者）。通配符 `*;q=0` 只把该参与者的权重
+   计 0，**不构成否决**。
+4. **决胜顺序**：在未否决且最低个人权重 > 0 的候选中，依次比较
+   **最低个人权重 → 总权重 → `supported_languages` 顺序**。
+5. **回退**：没有任何被所有人共同接受的候选时，返回 `default_language`，
+   `fallback=true`、`fallback_reason=no-common-acceptable-candidate`；若默认语言
+   本身被具体范围 `q=0` 否决，`message` 会额外说明。
+6. **可解释性**：`candidates[].weights[]` 给出每位参与者对该候选的实际命中范围
+   （`matched_range`）与权重，`vetoed_by` 给出否决者名单，便于向用户解释决策。
+
+校验（均返回 **HTTP 422**）：`participants` 为空数组、参与者 `id` 重复或缺失、
+某参与者的 `accept_language` 语法非法（`loc` 形如
+`["body","participants",1,"accept_language"]`，`type` 为
+`accept_language.syntax_error`），以及沿用单人接口的
+`supported_languages` / `default_language` 校验。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -268,7 +354,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 69 个单元/接口测试
+pytest -q          # 93 个单元/接口测试
 ```
 
 ## 项目结构

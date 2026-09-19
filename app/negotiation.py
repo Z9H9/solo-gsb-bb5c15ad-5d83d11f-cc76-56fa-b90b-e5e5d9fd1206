@@ -16,7 +16,13 @@ Implements the negotiation rules required by the service:
   ``locale_fallbacks`` chains (source tag -> next tag) are walked starting
   from the client's positive-q concrete ranges, in descending q / header
   order; a chain node that is a supported tag wins, unless it is excluded
-  by any concrete q=0 range, in which case the walk continues.
+  by any concrete q=0 range, in which case the walk continues;
+* :func:`negotiate_group` reuses the exact same per-person matching
+  semantics for several participants at once: the per-candidate weights
+  form a participants x candidates matrix, any candidate excluded by a
+  participant's concrete ``q=0`` range is globally vetoed, and the winner
+  is chosen by highest minimum personal weight, then highest total
+  weight, then server-list order.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -49,6 +55,23 @@ _QVALUE_RE = re.compile(r"^(?:0(?:\.\d{1,3})?|1(?:\.0{1,3})?)$")
 
 class AcceptLanguageError(ValueError):
     """Raised when an Accept-Language header value is syntactically invalid."""
+
+
+class ParticipantHeaderError(AcceptLanguageError):
+    """A group participant's Accept-Language header failed to parse.
+
+    Carries the 1-based ``position`` and ``participant_id`` of the
+    offending participant so the API layer can point the 422 response at
+    the exact ``participants`` array element.
+    """
+
+    def __init__(self, participant_id: str, position: int, detail: str):
+        self.participant_id = participant_id
+        self.position = position
+        super().__init__(
+            f"第 {position} 位参与者 {participant_id!r} 的 "
+            f"Accept-Language 非法: {detail}"
+        )
 
 
 class LocaleFallbackError(ValueError):
@@ -321,6 +344,38 @@ def _chain_fallback(
     return None
 
 
+def _collect_ignored_duplicates(header: str | None) -> list[dict[str, Any]]:
+    """Report duplicate header elements dropped by first-wins parsing.
+
+    Purely diagnostic: mirrors the de-duplication done by
+    :func:`parse_accept_language` and lists every later occurrence.
+    """
+
+    ignored: list[dict[str, Any]] = []
+    if header and header.strip():
+        seen: set[str] = set()
+        for position, element in enumerate(header.split(","), start=1):
+            token = element.strip()
+            tag = token.split(";", 1)[0].strip().lower()
+            if tag in seen:
+                ignored.append({"range": tag, "position": position})
+            else:
+                seen.add(tag)
+    return ignored
+
+
+def _default_supported_index(supported: list[str], default: str) -> int:
+    """Index of ``default`` inside ``supported`` (case-insensitive).
+
+    The request schema guarantees the default is contained in the
+    supported list case-insensitively, so the lookup must be too.
+    """
+
+    return next(
+        i for i, tag in enumerate(supported) if tag.lower() == default.lower()
+    )
+
+
 def negotiate(
     header: str | None,
     supported: list[str],
@@ -344,19 +399,7 @@ def negotiate(
 
     parsed = parse_accept_language(header)
 
-    ignored_duplicates: list[dict[str, Any]] = []
-    if header and header.strip():
-        # Second pass purely for reporting dropped duplicate elements.
-        seen: set[str] = set()
-        for position, element in enumerate(header.split(","), start=1):
-            token = element.strip()
-            tag = token.split(";", 1)[0].strip().lower()
-            if tag in seen:
-                ignored_duplicates.append(
-                    {"range": tag, "position": position}
-                )
-            else:
-                seen.add(tag)
+    ignored_duplicates = _collect_ignored_duplicates(header)
 
     candidates: list[dict[str, Any]] = []
     for index, candidate in enumerate(supported):
@@ -474,9 +517,7 @@ def negotiate(
         )
         reason = None
     elif used_fallback:
-        selected_index = next(
-            i for i, tag in enumerate(supported) if tag == default
-        )
+        selected_index = _default_supported_index(supported, default)
         if not parsed:
             reason = "no-valid-range"
             message = "Accept-Language 缺失或没有有效范围，回退到默认语言"
@@ -518,4 +559,142 @@ def negotiate(
             if chain_report is not None
             else None
         ),
+    }
+
+
+def negotiate_group(
+    participants: list[tuple[str, str | None]],
+    supported: list[str],
+    default: str,
+) -> dict[str, Any]:
+    """Negotiate a single language acceptable to a whole group.
+
+    ``participants`` is a non-empty list of ``(id, accept_language)``
+    pairs (id uniqueness is enforced by the request schema). Every
+    participant's header is evaluated with the exact RFC 9110/4647
+    lookup semantics of :func:`negotiate`, producing a
+    participants x candidates weight matrix:
+
+    * a candidate matched by any participant's *concrete* ``q=0`` range
+      is globally vetoed (the wildcard ``*;q=0`` only zeroes that
+      participant's weight, it does not veto);
+    * a participant without a header (``None``/blank) abstains: every
+      candidate counts as q=1 for them and they never veto (per
+      RFC 9110 an absent Accept-Language means any language is
+      acceptable);
+    * among the surviving candidates the winner has the highest minimum
+      personal weight, then the highest total weight, then the earliest
+      position in ``supported``;
+    * when no candidate is acceptable to everyone, ``default`` is
+      returned with ``fallback`` set and reason
+      ``no-common-acceptable-candidate``.
+    """
+
+    parsed_headers: list[list[LanguageRange]] = []
+    participant_reports: list[dict[str, Any]] = []
+    for position, (participant_id, header) in enumerate(participants, start=1):
+        try:
+            parsed = parse_accept_language(header)
+        except AcceptLanguageError as exc:
+            raise ParticipantHeaderError(
+                participant_id, position, str(exc)
+            ) from exc
+        parsed_headers.append(parsed)
+        participant_reports.append(
+            {
+                "id": participant_id,
+                "position": position,
+                "abstained": not parsed,
+                "parsed_ranges": [entry.to_dict() for entry in parsed],
+                "ignored_duplicates": _collect_ignored_duplicates(header),
+            }
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for index, candidate in enumerate(supported):
+        chain = truncation_chain(candidate)
+        weights: list[dict[str, Any]] = []
+        vetoed_by: list[str] = []
+        for report, parsed in zip(participant_reports, parsed_headers):
+            participant_id = report["id"]
+            if report["abstained"]:
+                weights.append(
+                    {
+                        "participant_id": participant_id,
+                        "q": 1.0,
+                        "matched_range": None,
+                        "veto": False,
+                    }
+                )
+                continue
+            matched, _prefix = _find_concrete_range(chain, parsed)
+            effective = matched if matched is not None else _wildcard_range(parsed)
+            veto = matched is not None and matched.q == 0
+            if veto:
+                vetoed_by.append(participant_id)
+            weights.append(
+                {
+                    "participant_id": participant_id,
+                    "q": effective.q if effective is not None else 0.0,
+                    "matched_range": (
+                        effective.range if effective is not None else None
+                    ),
+                    "veto": veto,
+                }
+            )
+        min_q = min(entry["q"] for entry in weights)
+        # Sums of 3-decimal q values are exact 3-decimal decimals; the
+        # rounding only absorbs binary float noise so that equal totals
+        # tie reliably and fall through to the server-order tiebreak.
+        total_q = round(sum(entry["q"] for entry in weights), 6)
+        candidates.append(
+            {
+                "tag": candidate,
+                "supported_index": index,
+                "min_q": min_q,
+                "total_q": total_q,
+                "vetoed": bool(vetoed_by),
+                "vetoed_by": vetoed_by,
+                "status": (
+                    "vetoed"
+                    if vetoed_by
+                    else "eligible" if min_q > 0 else "unacceptable"
+                ),
+                "weights": weights,
+            }
+        )
+
+    eligible = [c for c in candidates if not c["vetoed"] and c["min_q"] > 0]
+    if eligible:
+        winner = min(
+            eligible,
+            key=lambda c: (-c["min_q"], -c["total_q"], c["supported_index"]),
+        )
+        winner["status"] = "selected"
+        selected_index = winner["supported_index"]
+        fallback = False
+        reason = None
+        message = (
+            "已按群体规则选出共同接受的最佳语言"
+            "（先比较最低个人权重，再比较总权重，最后按服务端列表顺序）"
+        )
+    else:
+        selected_index = _default_supported_index(supported, default)
+        fallback = True
+        reason = "no-common-acceptable-candidate"
+        message = (
+            "没有任何候选被所有参与者共同接受"
+            "（被具体范围 q=0 否决，或对某位参与者权重为 0），回退到默认语言"
+        )
+        if candidates[selected_index]["vetoed"]:
+            message += "；注意默认语言本身被部分参与者以具体范围 q=0 否决"
+
+    return {
+        "selected_language": supported[selected_index],
+        "selected_supported_index": selected_index,
+        "fallback": fallback,
+        "fallback_reason": reason,
+        "message": message,
+        "participants": participant_reports,
+        "candidates": candidates,
     }

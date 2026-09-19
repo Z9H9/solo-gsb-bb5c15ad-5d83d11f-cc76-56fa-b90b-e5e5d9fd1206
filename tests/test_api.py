@@ -279,3 +279,158 @@ def test_locale_fallback_must_be_object_422():
         }
     )
     assert response.status_code == 422
+
+
+def _post_group(payload):
+    return client.post("/api/v1/negotiate/group", json=payload)
+
+
+def test_group_negotiate_success():
+    response = _post_group(
+        {
+            "participants": [
+                {"id": "alice", "accept_language": "zh;q=0.9,en;q=0.8"},
+                {"id": "bob", "accept_language": "zh;q=0.7"},
+                {"id": "carol"},
+            ],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_language"] == "zh-CN"
+    assert body["selected_supported_index"] == 1
+    assert body["fallback"] is False
+    assert body["fallback_reason"] is None
+    # carol provided no header -> abstains (accepts anything, never vetoes).
+    assert body["participants"][2]["abstained"] is True
+    zh_cn = body["candidates"][1]
+    assert zh_cn["status"] == "selected"
+    assert zh_cn["min_q"] == 0.7
+    assert zh_cn["total_q"] == 2.6
+    assert zh_cn["vetoed"] is False
+    assert zh_cn["vetoed_by"] == []
+    assert [w["matched_range"] for w in zh_cn["weights"]] == [
+        "zh",
+        "zh",
+        None,
+    ]
+
+
+def test_group_concrete_q_zero_veto():
+    response = _post_group(
+        {
+            "participants": [
+                {"id": "alice", "accept_language": "zh;q=0,*;q=0.6"},
+                {"id": "bob", "accept_language": "zh;q=0.9,*;q=0.7"},
+            ],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # zh-CN/zh-TW are vetoed by alice despite bob's q=0.9.
+    assert body["selected_language"] == "en-US"
+    zh_cn = body["candidates"][1]
+    assert zh_cn["vetoed"] is True
+    assert zh_cn["vetoed_by"] == ["alice"]
+    assert zh_cn["status"] == "vetoed"
+
+
+def test_group_fallback_when_no_common_candidate():
+    response = _post_group(
+        {
+            "participants": [
+                {"id": "alice", "accept_language": "en;q=0"},
+                {"id": "bob", "accept_language": "zh;q=0,ja;q=0"},
+            ],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_language"] == "en-US"
+    assert body["fallback"] is True
+    assert body["fallback_reason"] == "no-common-acceptable-candidate"
+
+
+def test_group_empty_participants_422():
+    response = _post_group(
+        {
+            "participants": [],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_group_duplicate_participant_id_422():
+    response = _post_group(
+        {
+            "participants": [
+                {"id": "alice", "accept_language": "en"},
+                {"id": "alice", "accept_language": "zh"},
+            ],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "participants"]
+    assert "重复" in detail[0]["msg"]
+
+
+def test_group_participant_invalid_header_422():
+    response = _post_group(
+        {
+            "participants": [
+                {"id": "alice", "accept_language": "en"},
+                {"id": "bob", "accept_language": "fr;q=2"},
+            ],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "participants", 1, "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+    assert "bob" in detail[0]["msg"]
+
+
+def test_group_default_not_in_supported_422():
+    response = _post_group(
+        {
+            "participants": [{"id": "alice"}],
+            "supported_languages": SUPPORTED,
+            "default_language": "fr-FR",
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_group_missing_participant_id_422():
+    response = _post_group(
+        {
+            "participants": [{"accept_language": "en"}],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_group_extra_field_rejected_422():
+    response = _post_group(
+        {
+            "participants": [{"id": "alice", "role": "admin"}],
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
