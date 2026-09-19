@@ -4,8 +4,10 @@ import pytest
 
 from app.negotiation import (
     AcceptLanguageError,
+    GroupParticipantInput,
     LocaleFallbackError,
     negotiate,
+    negotiate_group,
     normalize_fallbacks,
     parse_accept_language,
     truncation_chain,
@@ -360,3 +362,206 @@ class TestLocaleChainFallback:
         result = negotiate("de", self.SUPPORTED, self.DEFAULT)
         assert "locale_fallback" in result
         assert result["locale_fallback"] is None
+
+
+class TestGroupNegotiation:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    def _group(self, *pairs):
+        return negotiate_group(
+            [GroupParticipantInput(id=pid, accept_language=header) for pid, header in pairs],
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+
+    def _candidate(self, result, tag):
+        return next(c for c in result["candidates"] if c["tag"] == tag)
+
+    def test_basic_selection_by_min_and_total_q(self):
+        result = self._group(
+            ("a", "zh-CN;q=0.8,en;q=0.5"),
+            ("b", "zh;q=0.9,en;q=0.4,*;q=0.1"),
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["selected_supported_index"] == 1
+        assert result["fallback"] is False
+        zh_cn = self._candidate(result, "zh-CN")
+        assert zh_cn["status"] == "selected"
+        assert zh_cn["min_q"] == 0.8
+        assert zh_cn["total_q"] == 1.7
+        en_us = self._candidate(result, "en-US")
+        assert en_us["status"] == "eligible"
+        assert en_us["min_q"] == 0.4
+        assert en_us["total_q"] == 0.9
+
+    def test_min_q_outranks_total_q(self):
+        # en-US: (0.5, 0.9) -> min 0.5; zh-CN: (0.9, 0.4) -> min 0.4,
+        # even though zh-CN has the larger sum (1.3).
+        result = self._group(
+            ("a", "zh-CN;q=0.9,en;q=0.5"),
+            ("b", "zh-CN;q=0.4,en;q=0.9"),
+        )
+        assert result["selected_language"] == "en-US"
+
+    def test_full_tie_breaks_by_supported_order(self):
+        # Both zh-CN and zh-TW match prefix zh at q=0.5 for everyone.
+        result = self._group(
+            ("a", "zh;q=0.5"),
+            ("b", "zh;q=0.5,en;q=0.1"),
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert self._candidate(result, "zh-CN")["status"] == "selected"
+        assert self._candidate(result, "zh-TW")["status"] == "eligible"
+
+    def test_concrete_q_zero_is_global_veto(self):
+        result = self._group(
+            ("a", "zh-CN;q=0.9"),
+            ("b", "zh;q=0,en;q=0.5"),
+        )
+        assert result["fallback"] is True
+        assert result["fallback_reason"] == "no-common-acceptable-candidate"
+        assert result["selected_language"] == "en-US"
+        zh_cn = self._candidate(result, "zh-CN")
+        assert zh_cn["status"] == "vetoed"
+        assert zh_cn["min_q"] is None
+        assert zh_cn["total_q"] is None
+        assert zh_cn["vetoed_by"] == [
+            {
+                "participant_id": "b",
+                "matched_range": "zh",
+                "q": 0,
+                "header_position": 1,
+            }
+        ]
+        # Prefix q=0 also vetoes zh-TW even though a never asked for it.
+        assert self._candidate(result, "zh-TW")["status"] == "vetoed"
+
+    def test_wildcard_q_zero_is_not_a_veto(self):
+        result = self._group(
+            ("a", "zh-CN;q=0.9"),
+            ("b", "*;q=0"),
+        )
+        zh_cn = self._candidate(result, "zh-CN")
+        assert zh_cn["status"] == "not-common"
+        assert zh_cn["vetoed_by"] == []
+        rejection = zh_cn["rejected_by"][0]
+        assert rejection["participant_id"] == "b"
+        assert rejection["status"] == "excluded"
+        assert rejection["matched_range"] == "*"
+        assert result["fallback"] is True
+
+    def test_unmatched_participant_makes_candidate_not_common(self):
+        result = self._group(
+            ("a", "zh-CN;q=0.9"),
+            ("b", "en;q=0.8"),
+        )
+        zh_cn = self._candidate(result, "zh-CN")
+        assert zh_cn["status"] == "not-common"
+        assert zh_cn["rejected_by"][0] == {
+            "participant_id": "b",
+            "matched_range": None,
+            "q": None,
+            "status": "unmatched",
+        }
+        assert result["fallback"] is True
+
+    def test_missing_or_empty_header_imposes_no_preference(self):
+        result = self._group(
+            ("a", "zh-CN;q=0.9"),
+            ("b", None),
+            ("c", "   "),
+        )
+        assert result["fallback"] is False
+        assert result["selected_language"] == "zh-CN"
+        cells = self._candidate(result, "zh-CN")["cells"]
+        assert [cell["status"] for cell in cells] == [
+            "eligible",
+            "no-range",
+            "no-range",
+        ]
+        assert cells[1]["matched_range"] is None
+        assert cells[1]["q"] is None
+
+    def test_single_participant_matches_single_negotiation(self):
+        result = self._group(("a", "zh-TW;q=0.95,zh;q=0.9,en;q=0.8,*;q=0.5"))
+        assert result["selected_language"] == "zh-TW"
+        zh_cn = self._candidate(result, "zh-CN")
+        assert zh_cn["status"] == "eligible"
+        assert zh_cn["cells"][0]["matched_range"] == "zh"
+        assert zh_cn["cells"][0]["q"] == 0.9
+        assert zh_cn["cells"][0]["matched_via"] == "concrete"
+        ja = self._candidate(result, "ja-JP")
+        assert ja["cells"][0]["matched_range"] == "*"
+        assert ja["cells"][0]["matched_via"] == "wildcard"
+
+    def test_participant_reports_carry_actual_hits(self):
+        result = self._group(
+            ("a", "zh-CN;q=0.8,en;q=0.5"),
+            ("b", "zh;q=0.9"),
+        )
+        reports = {report["id"]: report for report in result["participants"]}
+        assert reports["a"]["accept_language"] == "zh-CN;q=0.8,en;q=0.5"
+        assert [(r["range"], r["q"]) for r in reports["b"]["parsed_ranges"]] == [
+            ("zh", 0.9)
+        ]
+        # Participant b's zh-CN cell (supported_index 1) hits prefix zh.
+        b_zh = next(
+            cell
+            for cell in reports["b"]["cells"]
+            if cell["supported_index"] == 1
+        )
+        assert b_zh["matched_range"] == "zh"
+        assert b_zh["q"] == 0.9
+        # Participant b has no wildcard, so ja-JP is unmatched.
+        b_ja = next(
+            cell
+            for cell in reports["b"]["cells"]
+            if cell["supported_index"] == 3
+        )
+        assert b_ja["status"] == "unmatched"
+
+    def test_ignored_duplicate_ranges_reported_per_participant(self):
+        result = self._group(("a", "en;q=0.8,en;q=0.2"), ("b", "en"))
+        reports = {report["id"]: report for report in result["participants"]}
+        assert reports["a"]["ignored_duplicates"] == [
+            {"range": "en", "position": 2}
+        ]
+        assert reports["b"]["ignored_duplicates"] == []
+        en_us = self._candidate(result, "en-US")
+        # First occurrence (q=0.8) decides the weight.
+        assert en_us["cells"][0]["q"] == 0.8
+
+    def test_all_participants_no_ranges_selects_first_supported(self):
+        result = self._group(("a", None), ("b", ""))
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is False
+        for candidate in result["candidates"]:
+            assert candidate["status"] in ("selected", "eligible")
+            assert candidate["min_q"] == 1.0
+            assert candidate["total_q"] == 1.0
+
+    def test_fallback_message_mentions_veto_when_default_vetoed(self):
+        result = self._group(
+            ("a", "zh-CN"),
+            ("b", "en;q=0"),
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+        assert "否决" in result["message"]
+
+    def test_malformed_header_raises_same_error_as_single_endpoint(self):
+        with pytest.raises(AcceptLanguageError):
+            self._group(("a", "en;q=2"), ("b", "en"))
+
+    def test_wildcard_makes_wildcard_only_candidates_acceptable(self):
+        # b wildcard accepts ja-JP, a does not match it -> not common;
+        # en-US is acceptable to both via prefix/wildcard -> selected.
+        result = self._group(
+            ("a", "en;q=0.7"),
+            ("b", "*;q=0.3"),
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is False
+        ja = self._candidate(result, "ja-JP")
+        assert ja["status"] == "not-common"

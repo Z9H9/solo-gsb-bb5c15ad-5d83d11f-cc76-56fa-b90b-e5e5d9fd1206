@@ -129,6 +129,31 @@ class LanguageRange:
         return {"range": self.range, "q": self.q, "position": self.position}
 
 
+@dataclass(frozen=True)
+class GroupParticipantInput:
+    """A single group participant: ``id`` plus the raw Accept-Language."""
+
+    id: str
+    accept_language: str | None
+
+
+def _collect_ignored_duplicates(header: str | None) -> list[dict[str, Any]]:
+    """Report duplicate elements of a header (the first occurrence is kept)."""
+
+    ignored: list[dict[str, Any]] = []
+    if not header or not header.strip():
+        return ignored
+    seen: set[str] = set()
+    for position, element in enumerate(header.split(","), start=1):
+        token = element.strip()
+        tag = token.split(";", 1)[0].strip().lower()
+        if tag in seen:
+            ignored.append({"range": tag, "position": position})
+        else:
+            seen.add(tag)
+    return ignored
+
+
 def _parse_qvalue(raw: str, position: int) -> float:
     # OWS around ";" and "=" is allowed per RFC 9110, but the parameter
     # itself must be non-empty and of the form q=value.
@@ -344,19 +369,7 @@ def negotiate(
 
     parsed = parse_accept_language(header)
 
-    ignored_duplicates: list[dict[str, Any]] = []
-    if header and header.strip():
-        # Second pass purely for reporting dropped duplicate elements.
-        seen: set[str] = set()
-        for position, element in enumerate(header.split(","), start=1):
-            token = element.strip()
-            tag = token.split(";", 1)[0].strip().lower()
-            if tag in seen:
-                ignored_duplicates.append(
-                    {"range": tag, "position": position}
-                )
-            else:
-                seen.add(tag)
+    ignored_duplicates = _collect_ignored_duplicates(header)
 
     candidates: list[dict[str, Any]] = []
     for index, candidate in enumerate(supported):
@@ -518,4 +531,209 @@ def negotiate(
             if chain_report is not None
             else None
         ),
+    }
+
+
+def _participant_cell(
+    chain: list[str],
+    parsed: list[LanguageRange],
+) -> dict[str, Any]:
+    """Build one participant's candidate matrix cell.
+
+    Mirrors the single-header semantics in :func:`negotiate`: the longest
+    truncation prefix matched by a concrete range decides the weight
+    (including concrete ``q=0`` exclusion); the wildcard ``*`` only
+    participates when no concrete range matched; missing/empty headers
+    impose no preference (treated as fully permissive).
+    """
+
+    matched, _matched_prefix = _find_concrete_range(chain, parsed)
+    wildcard = None if matched is not None else _wildcard_range(parsed)
+    effective = matched if matched is not None else wildcard
+
+    if not parsed:
+        status = "no-range"
+    elif matched is not None and matched.q == 0:
+        status = "excluded"
+    elif wildcard is not None and wildcard.q == 0:
+        status = "excluded"
+    elif effective is None:
+        status = "unmatched"
+    else:
+        status = "eligible"
+
+    return {
+        "matched_range": (
+            effective.range if effective is not None else None
+        ),
+        "matched_via": (
+            "concrete"
+            if matched is not None
+            else ("wildcard" if wildcard is not None else None)
+        ),
+        "q": effective.q if effective is not None else None,
+        "header_position": (
+            effective.position if effective is not None else None
+        ),
+        "status": status,
+    }
+
+
+def negotiate_group(
+    participants: list[GroupParticipantInput],
+    supported: list[str],
+    default: str,
+) -> dict[str, Any]:
+    """Negotiate one language accepted by every participant.
+
+    Each participant is evaluated against every supported tag using the
+    same RFC 9110 / RFC 4647 rules as :func:`negotiate`, producing a
+    per-participant weight matrix. A candidate excluded by any
+    participant through a **concrete** ``q=0`` range is globally vetoed.
+    Remaining candidates are common-acceptable only when no participant
+    rejects them, and are ranked by (descending) minimum individual q,
+    then (descending) summed q, then ``supported`` order. With no common
+    acceptable candidate the configured default is returned.
+    """
+
+    parsed_participants: list[tuple[GroupParticipantInput, list[LanguageRange]]] = [
+        (participant, parse_accept_language(participant.accept_language))
+        for participant in participants
+    ]
+
+    participant_reports: list[dict[str, Any]] = []
+    for participant, parsed in parsed_participants:
+        participant_reports.append(
+            {
+                "id": participant.id,
+                "accept_language": participant.accept_language,
+                "parsed_ranges": [entry.to_dict() for entry in parsed],
+                "ignored_duplicates": _collect_ignored_duplicates(
+                    participant.accept_language
+                ),
+                "cells": [],
+            }
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for index, candidate in enumerate(supported):
+        chain = truncation_chain(candidate)
+
+        vetoed_by: list[dict[str, Any]] = []
+        rejected_by: list[dict[str, Any]] = []
+        q_values: list[float] = []
+        cells: list[dict[str, Any]] = []
+        for offset, (participant, parsed) in enumerate(parsed_participants):
+            cell = _participant_cell(chain, parsed)
+            cells.append(cell)
+            participant_reports[offset]["cells"].append(
+                {
+                    "supported_index": index,
+                    "matched_range": cell["matched_range"],
+                    "matched_via": cell["matched_via"],
+                    "q": cell["q"],
+                    "header_position": cell["header_position"],
+                    "status": cell["status"],
+                }
+            )
+
+            if cell["status"] == "excluded" and cell["matched_via"] == "concrete":
+                vetoed_by.append(
+                    {
+                        "participant_id": participant.id,
+                        "matched_range": cell["matched_range"],
+                        "q": 0,
+                        "header_position": cell["header_position"],
+                    }
+                )
+            elif cell["status"] != "eligible" and cell["status"] != "no-range":
+                rejected_by.append(
+                    {
+                        "participant_id": participant.id,
+                        "matched_range": cell["matched_range"],
+                        "q": cell["q"],
+                        "status": cell["status"],
+                    }
+                )
+            elif cell["status"] == "eligible":
+                q_values.append(cell["q"])
+            # "no-range" (missing/empty header) imposes no constraint and
+            # contributes no weight.
+
+        if vetoed_by:
+            status = "vetoed"
+            min_q: float | None = None
+            total_q: float | None = None
+        elif rejected_by:
+            status = "not-common"
+            min_q = None
+            total_q = None
+        else:
+            status = "eligible"
+            min_q = min(q_values) if q_values else 1.0
+            # Round to avoid binary float noise in the explanation payload.
+            total_q = round(sum(q_values), 6) if q_values else 1.0
+
+        candidates.append(
+            {
+                "tag": candidate,
+                "supported_index": index,
+                "truncation_chain": chain,
+                "status": status,
+                "min_q": min_q,
+                "total_q": total_q,
+                "vetoed_by": vetoed_by,
+                "rejected_by": rejected_by,
+                "cells": cells,
+            }
+        )
+
+    eligible = [c for c in candidates if c["status"] == "eligible"]
+    fallback = not eligible
+    if eligible:
+        # Highest guaranteed individual weight first, then highest summed
+        # weight; min() keeps the earliest supported_index on full ties.
+        winner = min(
+            eligible,
+            key=lambda c: (-c["min_q"], -c["total_q"], c["supported_index"]),
+        )
+        selected_index = winner["supported_index"]
+        winner["status"] = "selected"
+        fallback_reason = None
+        message = (
+            "在所有参与者均可接受的候选中，按最低个人 q 最高、总 q 最高、"
+            "supported_languages 顺序最前的规则选出语言"
+        )
+    else:
+        # Default fallback: locate the configured tag case-insensitively
+        # (request validation guarantees it is present exactly once).
+        selected_index = next(
+            i
+            for i, tag in enumerate(supported)
+            if tag.lower() == default.lower()
+        )
+        fallback_reason = "no-common-acceptable-candidate"
+        default_report = candidates[selected_index]
+        if default_report["status"] == "vetoed":
+            message = (
+                "没有所有参与者共同可接受的候选（默认语言被参与者的具体 "
+                "q=0 范围全局否决），回退到默认语言"
+            )
+        else:
+            # Note: participants without any ranges are fully permissive,
+            # so reaching here always means at least one participant
+            # rejected candidates via q=0 / unmatched concrete handling.
+            message = (
+                "没有所有参与者共同可接受的候选（存在被具体 q=0 范围否决、"
+                "被 q=0 通配符排除或未命中任何范围的参与者），回退到默认语言"
+            )
+
+    return {
+        "selected_language": supported[selected_index],
+        "selected_supported_index": selected_index,
+        "fallback": fallback,
+        "fallback_reason": fallback_reason,
+        "message": message,
+        "candidates": candidates,
+        "participants": participant_reports,
     }

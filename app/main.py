@@ -6,8 +6,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .negotiation import AcceptLanguageError, negotiate
+from .negotiation import (
+    AcceptLanguageError,
+    GroupParticipantInput,
+    negotiate,
+    negotiate_group,
+)
 from .schemas import (
+    GroupNegotiationRequest,
+    GroupNegotiationResponse,
     HealthResponse,
     NegotiationRequest,
     NegotiationResponse,
@@ -78,6 +85,30 @@ async def negotiate_language(
     return JSONResponse(content=payload_body)
 
 
+@app.post(
+    "/api/v1/negotiate/group",
+    response_model=GroupNegotiationResponse,
+    tags=["语言协商"],
+    summary="在多位参与者之间协商共同可接受的服务端语言",
+)
+async def negotiate_language_group(
+    payload: GroupNegotiationRequest,
+) -> GroupNegotiationResponse:
+    """逐人复用单头协商语义形成候选权重矩阵并选出共同语言。"""
+    result = negotiate_group(
+        participants=[
+            GroupParticipantInput(
+                id=participant.id,
+                accept_language=participant.accept_language,
+            )
+            for participant in payload.participants
+        ],
+        supported=payload.supported_languages,
+        default=payload.default_language,
+    )
+    return GroupNegotiationResponse.model_validate(result)
+
+
 @app.get("/", tags=["元信息"])
 async def root() -> dict[str, str]:
     return {
@@ -86,4 +117,5 @@ async def root() -> dict[str, str]:
         "docs": "/docs",
         "health": "/health",
         "negotiate": "POST /api/v1/negotiate",
+        "negotiate_group": "POST /api/v1/negotiate/group",
     }

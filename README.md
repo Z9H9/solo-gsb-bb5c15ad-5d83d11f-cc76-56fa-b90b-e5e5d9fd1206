@@ -4,7 +4,9 @@
 BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4647 lookup 逐级截断
 匹配，选出最终语言，并返回**每一个候选标签的接受 / 淘汰轨迹**，方便网关侧排障与
 可观测。当标准 lookup 没有可接受候选时，还可通过可选的 `locale_fallbacks`
-源标签 → 下一标签有向链做定向回退。
+源标签 → 下一标签有向链做定向回退。此外，`POST /api/v1/negotiate/group`
+支持一次传入**多位参与者**，按「最低个人 q 最高、总 q 最高、服务端顺序最前」选出
+共同可接受语言，任一参与者的具体 `q=0` 范围都会全局否决对应候选。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -19,7 +21,8 @@ docker compose up -d --build
 | 地址 | 说明 |
 | --- | --- |
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
-| http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate | 单参与者语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/group | 多参与者群体协商接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -240,6 +243,172 @@ curl -i -X POST http://localhost:8000/api/v1/negotiate \
 }
 ```
 
+## 多参与者群体协商 `POST /api/v1/negotiate/group`
+
+当一次会话涉及多位参与者（多人会议、合订订阅等）时，群协商接口接收**非空**的
+`participants` 数组，逐人复用上面同一套 RFC 9110 / RFC 4647 匹配语义，形成
+「参与者 × 候选语言」的候选权重矩阵，并返回可解释的完整决策依据。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/group \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "participants": [
+      {"id": "alice", "accept_language": "zh-CN;q=0.9,en;q=0.6"},
+      {"id": "bob",   "accept_language": "zh;q=0.8,en;q=0.5,*;q=0.2"}
+    ],
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US"
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "selected_language": "zh-CN",
+  "selected_supported_index": 1,
+  "fallback": false,
+  "fallback_reason": null,
+  "candidates": [
+    {
+      "tag": "en-US",
+      "supported_index": 0,
+      "status": "eligible",
+      "min_q": 0.5,
+      "total_q": 1.1,
+      "vetoed_by": [],
+      "rejected_by": [],
+      "cells": [
+        {"matched_range": "en", "matched_via": "concrete", "q": 0.6,
+         "header_position": 2, "status": "eligible"},
+        {"matched_range": "en", "matched_via": "concrete", "q": 0.5,
+         "header_position": 2, "status": "eligible"}
+      ]
+    },
+    {
+      "tag": "zh-CN",
+      "supported_index": 1,
+      "status": "selected",
+      "min_q": 0.8,
+      "total_q": 1.7,
+      "vetoed_by": [],
+      "rejected_by": [],
+      "cells": [
+        {"matched_range": "zh-cn", "matched_via": "concrete", "q": 0.9,
+         "header_position": 1, "status": "eligible"},
+        {"matched_range": "zh", "matched_via": "concrete", "q": 0.8,
+         "header_position": 1, "status": "eligible"}
+      ]
+    },
+    {
+      "tag": "zh-TW",
+      "supported_index": 2,
+      "status": "not-common",
+      "min_q": null,
+      "total_q": null,
+      "vetoed_by": [],
+      "rejected_by": [
+        {"participant_id": "alice", "matched_range": null,
+         "q": null, "status": "unmatched"}
+      ],
+      "cells": [
+        {"matched_range": null, "matched_via": null, "q": null,
+         "header_position": null, "status": "unmatched"},
+        {"matched_range": "zh", "matched_via": "concrete", "q": 0.8,
+         "header_position": 1, "status": "eligible"}
+      ]
+    }
+  ],
+  "participants": [
+    {
+      "id": "alice",
+      "accept_language": "zh-CN;q=0.9,en;q=0.6",
+      "parsed_ranges": [
+        {"range": "zh-cn", "q": 0.9, "position": 1},
+        {"range": "en", "q": 0.6, "position": 2}
+      ],
+      "ignored_duplicates": [],
+      "cells": [
+        {"supported_index": 0, "matched_range": "en", "matched_via": "concrete",
+         "q": 0.6, "header_position": 2, "status": "eligible"},
+        {"supported_index": 1, "matched_range": "zh-cn", "matched_via": "concrete",
+         "q": 0.9, "header_position": 1, "status": "eligible"}
+      ]
+    }
+  ]
+}
+```
+
+### 请求体（群体协商）
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `participants` | object[] | 是 | **非空数组**；每项含 `id`（非空字符串、数组内唯一）与 `accept_language`（可空） |
+| `participants[].id` | string | 是 | 参与者唯一标识，用于 `vetoed_by` / `rejected_by` 归因 |
+| `participants[].accept_language` | string \| null | 否 | 该参与者的原始头；`null`/缺失/空白串表示**无偏好**，对任何候选都不构成约束 |
+| `supported_languages` | string[] | 是 | 与单参与者接口相同：至少 1 个、不可重复（大小写不敏感），顺序即决胜顺序 |
+| `default_language` | string | 是 | 无共同可接受候选时回退，必须包含在 `supported_languages` 中 |
+
+> 每位参与者的头在请求校验阶段即按 RFC 9110 解析；语法非法（如 `zh;q=2`）直接
+> 返回 422，`loc` 精确定位到 `["body","participants",<下标>,"accept_language"]`，
+> `type` 与单参与者接口同为 `accept_language.syntax_error`。
+
+### 群体决胜规则
+
+每位参与者对每个候选的命中方式与单参与者接口完全一致（具体范围优先于通配符、
+RFC 4647 逐级截断、头内重复范围保留第一次出现）。在此之上：
+
+1. **全局否决（veto）**：只要**任一**参与者以**具体范围 `q=0`** 排除某候选
+   （含前缀排除，如 `zh;q=0` 同时否决 `zh-CN`、`zh-TW`），该候选即标记为
+   `vetoed_by` 列出全部否决者（`participant_id`、命中的 `matched_range`、
+   `header_position`），无论其他参与者权重多高都不参与选择。
+2. **通配符 `*;q=0` 不构成全局否决**：与 `locale_fallbacks` 的契约一致，只有
+   具体 `q=0` 能否决；被通配符排除的候选标记为 `not-common`，对应参与者进入
+   `rejected_by`（`status="excluded"`）。未命中任何范围（含通配符）的参与者以
+   `status="unmatched"` 进入 `rejected_by`。
+3. **无偏好**：`accept_language` 为 `null`/缺失/空白的参与者单元格状态为
+   `no-range`，既不接受也不拒绝，不参与权重统计。
+4. **决胜顺序**（仅在全部参与者都可接受、且无人否决的候选中）：
+   1. **最低个人 q 最高**（最大化最不满意参与者的体验，max-min）；
+   2. 最低 q 相同则**个人 q 总和最高**；
+   3. 仍相同则取 `supported_languages` 中**顺序最前**者。
+5. **默认回退**：没有任何共同可接受候选（全部被否决或非共同可接受）时，返回
+   `default_language`，`fallback=true`、
+   `fallback_reason="no-common-acceptable-candidate"`，`message` 说明原因；
+   默认语言本身被具体 `q=0` 否决时会额外指出。
+
+### 响应要点（群体协商）
+
+- 顶层 `selected_language` / `selected_supported_index` / `fallback` /
+  `fallback_reason` / `message` 含义同单参与者接口。
+- `candidates[]`：每个候选含：
+  - `min_q` / `total_q`：各参与者实际命中范围的**最低权重**与**权重总和**
+    （无偏好者不计入；候选 `vetoed`/`not-common` 时均为 `null`）；
+  - `vetoed_by`：以**具体 q=0** 全局否决该候选的参与者及命中范围；
+  - `rejected_by`：以非否决方式不接受的参与者（通配符 q=0 的 `excluded`
+    或 `unmatched`）；
+  - `cells[]`：与 `participants` **同序**的逐人命中单元格（实际命中范围、
+    `concrete`/`wildcard` 命中方式、q、头中位置、状态）；
+  - `status`：`selected` / `eligible` / `vetoed` / `not-common`。
+- `participants[]`：与请求同序，回显原始 `accept_language`，并给出该人的
+  `parsed_ranges`、`ignored_duplicates` 以及针对每个候选的 `cells[]`
+  （额外携带 `supported_index`），便于按人解释决策。
+
+群体协商的 422 校验：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/negotiate/group \
+  -H 'Content-Type: application/json' \
+  -d '{"participants":[{"id":"a"},{"id":"a"}],
+       "supported_languages":["en"],"default_language":"en"}'
+```
+
+- `participants` 为空数组或缺失 → 422（`loc` 为 `["body","participants"]`）；
+- `id` 重复（含空串）→ 422（`loc` 为 `["body","participants"]` 或对应 `id`）；
+- 任一参与者的 `accept_language` 语法非法 → 422，定位到具体参与者下标；
+- `supported_languages` / `default_language` 的校验规则与单参与者接口一致。
+
 ## 配置
 
 所有配置均为可选项，默认值可直接本地使用：
@@ -268,7 +437,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 69 个单元/接口测试
+pytest -q          # 97 个单元/接口测试
 ```
 
 ## 项目结构
